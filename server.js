@@ -66,36 +66,39 @@ const stmtListJobs    = db.prepare(`SELECT * FROM broadcast_jobs ORDER BY starte
 
 function newToken() { return crypto.randomUUID(); }
 
-// ─── Multicast broadcast (fast path) ─────────────────────────────────────────
-// LINE Multicast: up to 500 userIds per call, same message for all.
-// Personalisation happens on the landing page via LIFF getProfile().
-//
-// 1M users → 2,000 multicast calls vs 1,000,000 push calls = 500× fewer API calls.
-// At concurrency=50, ~2,000/50 = 40 parallel batches ≈ ~8 seconds total.
-//
-// The message contains ONE shared URL; the landing page identifies each visitor
-// with liff.getProfile() and serves their personal content from the DB.
 const MULTICAST_BATCH = 500; // LINE API limit per multicast call
 
+// ─── Broadcast runner: LINE Broadcast API (1 call, all followers) ─────────────
+// Fastest possible — 1 API call regardless of follower count.
+// Personalisation still works via LIFF on the landing page.
+async function runBroadcastAllJob(jobId, baseUrl, messageTemplate) {
+  const landingUrl = `${baseUrl}/landing`;
+  const text = messageTemplate.replace('{link}', landingUrl);
+  try {
+    await client.broadcast({ messages: [{ type: 'text', text }] });
+    const { cnt } = stmtCountUsers.get();
+    stmtUpdateJob.run({ jobId, status: 'completed', sent: cnt, failed: 0, finishedAt: new Date().toISOString() });
+    console.log(`Job ${jobId} (broadcast) finished`);
+  } catch (err) {
+    console.error(`broadcast failed: ${err.message}`);
+    stmtUpdateJob.run({ jobId, status: 'failed', sent: 0, failed: 0, finishedAt: new Date().toISOString() });
+  }
+}
+
+// ─── Broadcast runner: Multicast (500 users/call, registered only) ────────────
 async function runMulticastJob(jobId, baseUrl, messageTemplate, concurrency) {
   const landingUrl = `${baseUrl}/landing`;
   const text = messageTemplate.replace('{link}', landingUrl);
 
-  // Stream userId chunks from DB — never loads all rows into RAM
   const allUsers = db.prepare(`SELECT userId FROM users`).pluck().all();
   const batches = [];
   for (let i = 0; i < allUsers.length; i += MULTICAST_BATCH) {
     batches.push(allUsers.slice(i, i + MULTICAST_BATCH));
   }
 
-  // Process `concurrency` multicast calls in parallel
-  let i = 0;
-  async function flush(chunk) {
+  async function sendBatch(chunk) {
     try {
-      await client.multicast({
-        to: chunk,
-        messages: [{ type: 'text', text }],
-      });
+      await client.multicast({ to: chunk, messages: [{ type: 'text', text }] });
       stmtIncrJob.run({ jobId, s: chunk.length, f: 0 });
     } catch (err) {
       console.error(`multicast batch failed: ${err.message}`);
@@ -103,21 +106,57 @@ async function runMulticastJob(jobId, baseUrl, messageTemplate, concurrency) {
     }
   }
 
-  while (i < batches.length) {
-    const window = batches.slice(i, i + concurrency);
-    await Promise.allSettled(window.map(flush));
-    i += concurrency;
+  for (let i = 0; i < batches.length; i += concurrency) {
+    await Promise.allSettled(batches.slice(i, i + concurrency).map(sendBatch));
   }
 
   const job = stmtGetJob.get({ jobId });
   stmtUpdateJob.run({
     jobId,
     status: job.failed > 0 ? 'completed_with_errors' : 'completed',
-    sent: job.sent,
-    failed: job.failed,
+    sent: job.sent, failed: job.failed,
     finishedAt: new Date().toISOString(),
   });
-  console.log(`Job ${jobId} finished — sent: ${job.sent}, failed: ${job.failed}`);
+  console.log(`Job ${jobId} (multicast) finished — sent: ${job.sent}, failed: ${job.failed}`);
+}
+
+// ─── Broadcast runner: Push (personalized link per user in message) ───────────
+// Slowest but embeds the unique link directly in the chat bubble.
+async function runPushJob(jobId, baseUrl, messageTemplate, concurrency) {
+  const iter = db.prepare(`SELECT userId, token FROM users`).iterate();
+  let pending = [];
+
+  async function flush() {
+    await Promise.allSettled(
+      pending.map(async ({ userId, token }) => {
+        const link = `${baseUrl}/landing?ref=${token}&uid=${userId}`;
+        const text = messageTemplate.replace('{link}', link);
+        try {
+          await client.pushMessage({ to: userId, messages: [{ type: 'text', text }] });
+          stmtIncrJob.run({ jobId, s: 1, f: 0 });
+        } catch (err) {
+          console.error(`push failed for ${userId}: ${err.message}`);
+          stmtIncrJob.run({ jobId, s: 0, f: 1 });
+        }
+      })
+    );
+    pending = [];
+  }
+
+  for (const row of iter) {
+    pending.push(row);
+    if (pending.length >= concurrency) await flush();
+  }
+  if (pending.length > 0) await flush();
+
+  const job = stmtGetJob.get({ jobId });
+  stmtUpdateJob.run({
+    jobId,
+    status: job.failed > 0 ? 'completed_with_errors' : 'completed',
+    sent: job.sent, failed: job.failed,
+    finishedAt: new Date().toISOString(),
+  });
+  console.log(`Job ${jobId} (push) finished — sent: ${job.sent}, failed: ${job.failed}`);
 }
 
 // ─── Webhook ──────────────────────────────────────────────────────────────────
@@ -169,12 +208,24 @@ app.get('/my-link', (req, res) => {
 });
 
 // ─── Broadcast ────────────────────────────────────────────────────────────────
-// POST /broadcast  { baseUrl?, message?, concurrency? }
-// Uses Multicast API — sends one shared landing URL to all users.
-// Landing page identifies each visitor via LIFF and shows personalised content.
+// POST /broadcast  { mode?, baseUrl?, message?, concurrency? }
+//
+// mode = "broadcast" (default) — 1 LINE API call, reaches ALL followers instantly.
+//                                Personalisation via LIFF on landing page.
+// mode = "multicast"           — ~2,000 calls for 1M users (registered only).
+//                                Personalisation via LIFF on landing page.
+// mode = "push"                — 1 call per user, unique link in the message itself.
+//                                Slowest but link is visible directly in chat bubble.
 app.post('/broadcast', (req, res) => {
   const { cnt } = stmtCountUsers.get();
-  if (cnt === 0) return res.status(400).json({ error: 'No registered users found' });
+  const mode = req.body.mode || 'broadcast';
+
+  if (!['broadcast', 'multicast', 'push'].includes(mode)) {
+    return res.status(400).json({ error: 'mode must be broadcast, multicast, or push' });
+  }
+  if (mode !== 'broadcast' && cnt === 0) {
+    return res.status(400).json({ error: 'No registered users found' });
+  }
 
   const baseUrl     = req.body.baseUrl || process.env.BASE_URL || `http://localhost:${PORT}`;
   const message     = req.body.message || 'สวัสดี! แตะลิ้งนี้เพื่อดูข้อมูลเฉพาะของคุณ: {link}';
@@ -185,11 +236,20 @@ app.post('/broadcast', (req, res) => {
   }
 
   const jobId = newToken();
-  const totalBatches = Math.ceil(cnt / MULTICAST_BATCH);
   stmtInsertJob.run({ jobId, total: cnt, message, baseUrl, startedAt: new Date().toISOString() });
 
+  const modeInfo = {
+    broadcast: { apiCalls: 1,                        label: '1 broadcast call (all followers)' },
+    multicast:  { apiCalls: Math.ceil(cnt / MULTICAST_BATCH), label: `${Math.ceil(cnt / MULTICAST_BATCH).toLocaleString()} multicast calls` },
+    push:       { apiCalls: cnt,                      label: `${cnt.toLocaleString()} push calls` },
+  }[mode];
+
   setImmediate(() => {
-    runMulticastJob(jobId, baseUrl, message, concurrency).catch((err) => {
+    const runner =
+      mode === 'broadcast' ? runBroadcastAllJob(jobId, baseUrl, message) :
+      mode === 'multicast' ? runMulticastJob(jobId, baseUrl, message, concurrency) :
+                             runPushJob(jobId, baseUrl, message, concurrency);
+    runner.catch((err) => {
       console.error(`Job ${jobId} crashed:`, err);
       stmtUpdateJob.run({ jobId, status: 'failed', sent: 0, failed: cnt, finishedAt: new Date().toISOString() });
     });
@@ -197,9 +257,10 @@ app.post('/broadcast', (req, res) => {
 
   res.status(202).json({
     jobId,
+    mode,
     total: cnt,
-    apiCalls: totalBatches,
-    message: `Broadcast started — ${cnt.toLocaleString()} users via ${totalBatches.toLocaleString()} multicast calls`,
+    apiCalls: modeInfo.apiCalls,
+    message: `Broadcast started — ${modeInfo.label}`,
     statusUrl: `/broadcast/status/${jobId}`,
   });
 });

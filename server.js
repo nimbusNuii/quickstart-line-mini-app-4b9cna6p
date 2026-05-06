@@ -66,7 +66,37 @@ const stmtListJobs    = db.prepare(`SELECT * FROM broadcast_jobs ORDER BY starte
 
 function newToken() { return crypto.randomUUID(); }
 
-const MULTICAST_BATCH = 500; // LINE API limit per multicast call
+const MULTICAST_BATCH  = 500;       // LINE multicast: max userIds per call
+const AUDIENCE_SIZE    = 1_500_000; // LINE audience: max users per group
+const AUDIENCE_UPLOAD  = 10_000;    // LINE audience: max userIds per upload request
+const AUDIENCE_POLL_MS = 5_000;     // polling interval while waiting for audience to be READY
+
+// ─── LINE REST helper (for Audience API not exposed in SDK) ───────────────────
+async function lineApi(method, path, body) {
+  const res = await fetch(`https://api.line.me${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`LINE API ${method} ${path} → ${res.status}: ${text}`);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+async function waitForAudience(audienceGroupId) {
+  for (;;) {
+    const data = await lineApi('GET', `/v2/bot/audienceGroup/${audienceGroupId}`);
+    const status = data.audienceGroup?.status;
+    if (status === 'READY') return;
+    if (status === 'FAILED') throw new Error(`Audience ${audienceGroupId} failed`);
+    await new Promise((r) => setTimeout(r, AUDIENCE_POLL_MS));
+  }
+}
 
 // ─── Broadcast runner: LINE Broadcast API (1 call, all followers) ─────────────
 // Fastest possible — 1 API call regardless of follower count.
@@ -159,7 +189,98 @@ async function runPushJob(jobId, baseUrl, messageTemplate, concurrency) {
   console.log(`Job ${jobId} (push) finished — sent: ${job.sent}, failed: ${job.failed}`);
 }
 
-// ─── Webhook ──────────────────────────────────────────────────────────────────
+// ─── Broadcast runner: Narrowcast via Audience (registered users, LINE-side delivery) ──
+//
+// Flow for 13M users:
+//   1. Chunk users into groups of 1.5M   → 9 audience groups
+//   2. Upload each group in parallel 10K-user batches → ~1,300 API calls
+//   3. Poll until all audiences are READY (LINE processes them async)
+//   4. Narrowcast sequentially (LINE allows 1 active narrowcast at a time)
+//   5. Delete audience groups (cleanup)
+//
+// Why use narrowcast vs multicast?
+//   - LINE delivers on their side — our server is free after step 4
+//   - Supports demographic/OS filtering (extend recipient object as needed)
+//   - For 13M: ~9 narrowcast calls vs 26,000 multicast calls
+async function runNarrowcastJob(jobId, baseUrl, messageTemplate, uploadConcurrency) {
+  const landingUrl = `${baseUrl}/landing`;
+  const text = messageTemplate.replace('{link}', landingUrl);
+
+  // 1. Load all userIds from DB (streamed to avoid OOM on 13M rows)
+  const allUsers = db.prepare(`SELECT userId FROM users`).pluck().all();
+  const total = allUsers.length;
+
+  // 2. Slice into audience groups of up to AUDIENCE_SIZE each
+  const audienceGroupIds = [];
+  const groupCount = Math.ceil(total / AUDIENCE_SIZE);
+
+  for (let gi = 0; gi < groupCount; gi++) {
+    const groupUsers = allUsers.slice(gi * AUDIENCE_SIZE, (gi + 1) * AUDIENCE_SIZE);
+
+    // Create the audience group
+    const created = await lineApi('POST', '/v2/bot/audienceGroup/upload', {
+      description: `job_${jobId}_g${gi}`,
+      isIfaAudience: false,
+    });
+    const audienceGroupId = created.audienceGroupId;
+    audienceGroupIds.push(audienceGroupId);
+
+    // Upload users in parallel batches of AUDIENCE_UPLOAD (10K each)
+    const uploadBatches = [];
+    for (let i = 0; i < groupUsers.length; i += AUDIENCE_UPLOAD) {
+      uploadBatches.push(groupUsers.slice(i, i + AUDIENCE_UPLOAD));
+    }
+
+    for (let i = 0; i < uploadBatches.length; i += uploadConcurrency) {
+      await Promise.allSettled(
+        uploadBatches.slice(i, i + uploadConcurrency).map((batch) =>
+          lineApi('PUT', '/v2/bot/audienceGroup/upload', {
+            audienceGroupId,
+            audiences: batch.map((id) => ({ id })),
+          })
+        )
+      );
+    }
+    console.log(`Job ${jobId}: audience group ${gi + 1}/${groupCount} uploaded (${groupUsers.length} users)`);
+  }
+
+  // 3. Wait for all audience groups to become READY
+  console.log(`Job ${jobId}: waiting for ${audienceGroupIds.length} audience groups to be READY…`);
+  await Promise.all(audienceGroupIds.map(waitForAudience));
+  console.log(`Job ${jobId}: all audiences READY, starting narrowcast`);
+
+  // 4. Narrowcast sequentially (LINE enforces 1 active narrowcast at a time)
+  for (let i = 0; i < audienceGroupIds.length; i++) {
+    await lineApi('POST', '/v2/bot/message/narrowcast', {
+      messages: [{ type: 'text', text }],
+      recipient: { type: 'audience', audienceGroupId: audienceGroupIds[i] },
+    });
+    stmtIncrJob.run({
+      jobId,
+      s: Math.min(AUDIENCE_SIZE, total - i * AUDIENCE_SIZE),
+      f: 0,
+    });
+    console.log(`Job ${jobId}: narrowcast ${i + 1}/${audienceGroupIds.length} sent`);
+    // Brief pause between narrowcasts
+    if (i < audienceGroupIds.length - 1) await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  // 5. Cleanup audience groups (fire-and-forget, not critical)
+  for (const id of audienceGroupIds) {
+    lineApi('DELETE', `/v2/bot/audienceGroup/${id}`).catch((e) =>
+      console.warn(`cleanup audience ${id} failed: ${e.message}`)
+    );
+  }
+
+  const job = stmtGetJob.get({ jobId });
+  stmtUpdateJob.run({
+    jobId,
+    status: job.failed > 0 ? 'completed_with_errors' : 'completed',
+    sent: job.sent, failed: job.failed,
+    finishedAt: new Date().toISOString(),
+  });
+  console.log(`Job ${jobId} (narrowcast) finished — sent: ${job.sent}, failed: ${job.failed}`);
+}
 app.post(
   '/webhook',
   express.raw({ type: 'application/json' }),
@@ -210,18 +331,17 @@ app.get('/my-link', (req, res) => {
 // ─── Broadcast ────────────────────────────────────────────────────────────────
 // POST /broadcast  { mode?, baseUrl?, message?, concurrency? }
 //
-// mode = "broadcast" (default) — 1 LINE API call, reaches ALL followers instantly.
-//                                Personalisation via LIFF on landing page.
-// mode = "multicast"           — ~2,000 calls for 1M users (registered only).
-//                                Personalisation via LIFF on landing page.
-// mode = "push"                — 1 call per user, unique link in the message itself.
-//                                Slowest but link is visible directly in chat bubble.
+// mode = "broadcast"  (default) — 1 call, ALL followers, instant. LIFF personalizes on landing.
+// mode = "narrowcast"           — upload audiences → narrowcast per group. LIFF personalizes.
+//                                 Best for 13M+ registered users; LINE delivers on their side.
+// mode = "multicast"            — 500 users/call, registered only. LIFF personalizes on landing.
+// mode = "push"                 — 1 call/user, unique link visible directly in message. Slowest.
 app.post('/broadcast', (req, res) => {
   const { cnt } = stmtCountUsers.get();
   const mode = req.body.mode || 'broadcast';
 
-  if (!['broadcast', 'multicast', 'push'].includes(mode)) {
-    return res.status(400).json({ error: 'mode must be broadcast, multicast, or push' });
+  if (!['broadcast', 'narrowcast', 'multicast', 'push'].includes(mode)) {
+    return res.status(400).json({ error: 'mode must be broadcast, narrowcast, multicast, or push' });
   }
   if (mode !== 'broadcast' && cnt === 0) {
     return res.status(400).json({ error: 'No registered users found' });
@@ -238,17 +358,20 @@ app.post('/broadcast', (req, res) => {
   const jobId = newToken();
   stmtInsertJob.run({ jobId, total: cnt, message, baseUrl, startedAt: new Date().toISOString() });
 
+  const audienceGroups = Math.ceil(cnt / AUDIENCE_SIZE);
   const modeInfo = {
-    broadcast: { apiCalls: 1,                        label: '1 broadcast call (all followers)' },
+    broadcast:  { apiCalls: 1,                              label: '1 broadcast call (all followers)' },
+    narrowcast: { apiCalls: audienceGroups,                 label: `${audienceGroups} narrowcast calls (via ${audienceGroups} audience groups)` },
     multicast:  { apiCalls: Math.ceil(cnt / MULTICAST_BATCH), label: `${Math.ceil(cnt / MULTICAST_BATCH).toLocaleString()} multicast calls` },
-    push:       { apiCalls: cnt,                      label: `${cnt.toLocaleString()} push calls` },
+    push:       { apiCalls: cnt,                            label: `${cnt.toLocaleString()} push calls` },
   }[mode];
 
   setImmediate(() => {
     const runner =
-      mode === 'broadcast' ? runBroadcastAllJob(jobId, baseUrl, message) :
-      mode === 'multicast' ? runMulticastJob(jobId, baseUrl, message, concurrency) :
-                             runPushJob(jobId, baseUrl, message, concurrency);
+      mode === 'broadcast'  ? runBroadcastAllJob(jobId, baseUrl, message) :
+      mode === 'narrowcast' ? runNarrowcastJob(jobId, baseUrl, message, concurrency) :
+      mode === 'multicast'  ? runMulticastJob(jobId, baseUrl, message, concurrency) :
+                              runPushJob(jobId, baseUrl, message, concurrency);
     runner.catch((err) => {
       console.error(`Job ${jobId} crashed:`, err);
       stmtUpdateJob.run({ jobId, status: 'failed', sent: 0, failed: cnt, finishedAt: new Date().toISOString() });

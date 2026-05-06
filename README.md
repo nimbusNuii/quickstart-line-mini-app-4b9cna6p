@@ -1,21 +1,45 @@
 # LINE Mini App — Personalized Broadcast
 
 ส่ง LINE message พร้อมลิ้งเฉพาะบุคคลให้ผู้ใช้แต่ละคน  
-รองรับผู้ใช้หลักล้านคนด้วย **SQLite + background jobs**
+รองรับผู้ใช้ **13 ล้านคน** ด้วย SQLite + background jobs
 
 ---
 
-## เปรียบเทียบ 3 Mode
+## เปรียบเทียบ 4 Mode (สำหรับ 13 ล้านคน)
 
-| | `push` | `multicast` | `broadcast` ⭐ |
-|---|---|---|---|
-| LINE API calls (1M คน) | **1,000,000** | **2,000** | **1** |
-| เวลาโดยประมาณ | ~67 นาที | ~8 วิ | **ทันที** |
-| ส่งหา | เฉพาะ registered | เฉพาะ registered | **ทุก follower** |
-| ลิ้งใน message | ✅ unique ต่อคน | ❌ URL เดียวกัน | ❌ URL เดียวกัน |
-| Personalize | ใน message | via LIFF landing | via LIFF landing |
+| | `broadcast` ⭐ | `narrowcast` | `multicast` | `push` |
+|---|---|---|---|---|
+| **API calls** | **1** | **9** | **26,000** | **13,000,000** |
+| **เวลาโดยประมาณ** | **ทันที** | ~2-5 นาที* | ~2 นาที | หลายชั่วโมง |
+| **ส่งหา** | ทุก follower | registered เท่านั้น | registered เท่านั้น | registered เท่านั้น |
+| **ลิ้ง unique ใน message** | ❌ | ❌ | ❌ | ✅ |
+| **Personalize** | via LIFF | via LIFF | via LIFF | ใน message |
+| **Demographic filter** | ❌ | ✅ | ❌ | ❌ |
+| **Server load** | ต่ำมาก | ต่ำ (LINE ส่งให้) | ปานกลาง | สูงมาก |
 
-**แนะนำ:** ใช้ `broadcast` — 1 call เดียว ทุกคนรับ URL เดียวกัน พอคลิกเข้า landing page แล้ว LIFF จะ `getProfile()` เพื่อแสดงข้อมูลเฉพาะบุคคลจาก DB
+\* narrowcast: รวมเวลา upload audience + รอ LINE process (~1-3 นาที) + 9 narrowcast calls
+
+**สรุปแนะนำ:**
+- ต้องการส่งถึง **ทุก follower** และ personalize via LIFF → ใช้ **`broadcast`**
+- ต้องการ **demographic filter** หรือส่งเฉพาะ registered users → ใช้ **`narrowcast`**
+- ต้องการ **ลิ้ง unique ใน message เลย** (ไม่ผ่าน LIFF) → ใช้ **`push`** (ช้า)
+
+---
+
+## ทำไม Narrowcast ถึงดีสำหรับ 13 ล้าน
+
+```
+13M users ÷ 1,500,000 per audience = 9 audience groups
+
+Upload phase: 13M ÷ 10,000 per batch = 1,300 API calls
+              → parallel 50 concurrent = ~5 seconds
+
+Wait phase:   LINE processes audiences async → ~1-3 minutes
+
+Narrowcast:   9 sequential calls → ~18 seconds
+
+Total: ~2-5 minutes  vs  Push: หลายชั่วโมง
+```
 
 ---
 
@@ -31,9 +55,10 @@ LINE Webhook (follow/message/unfollow)                  │
 Admin triggers broadcast                                │
   └─ POST /broadcast { mode } ───────────────────► background job
        returns jobId immediately                        │
-                              broadcast: 1 call ────────┤
-                              multicast: 2K calls ──────┤
-                              push: 1M calls ───────────┘
+                         broadcast:   1 call ───────────┤
+                         narrowcast:  9 calls ──────────┤ (13M users)
+                         multicast: 26K calls ──────────┤
+                         push:       13M calls ─────────┘
 
 User clicks link → /landing → liff.getProfile() → GET /my-link → personalized content
 ```
@@ -42,36 +67,13 @@ User clicks link → /landing → liff.getProfile() → GET /my-link → persona
 
 ## วิธี Setup
 
-### 1. ติดตั้ง dependencies
-
 ```bash
 npm install
-```
-
-### 2. ตั้งค่า Environment Variables
-
-```bash
-cp .env.example .env
-```
-
-แก้ไข `.env`:
-
-```
-LINE_CHANNEL_SECRET=<Channel Secret จาก LINE Developers>
-LINE_CHANNEL_ACCESS_TOKEN=<Channel Access Token>
-LIFF_ID=<LIFF ID>
-BASE_URL=https://your-server-domain.com
-PORT=3000
-```
-
-### 3. รัน Server
-
-```bash
+cp .env.example .env   # แก้ไข credentials
 npm start
 ```
 
-### 4. ตั้ง Webhook URL ใน LINE Developers Console
-
+ตั้ง Webhook URL ใน LINE Developers Console:
 ```
 https://your-server-domain.com/webhook
 ```
@@ -82,56 +84,44 @@ https://your-server-domain.com/webhook
 
 | Method | Path | คำอธิบาย |
 |--------|------|-----------|
-| `POST` | `/webhook` | รับ events จาก LINE (follow, message, unfollow) |
+| `POST` | `/webhook` | รับ events จาก LINE |
 | `POST` | `/register` | ลงทะเบียน userId จาก LIFF |
 | `GET`  | `/my-link?userId=` | ดึงลิ้งเฉพาะบุคคล (เรียกจาก landing page) |
-| `POST` | `/broadcast` | เริ่ม broadcast job (ตอบกลับทันที พร้อม jobId) |
+| `POST` | `/broadcast` | เริ่ม broadcast job (ตอบกลับทันที) |
 | `GET`  | `/broadcast/status/:jobId` | ตรวจสอบ progress |
 | `GET`  | `/broadcast/status` | ดู 20 jobs ล่าสุด |
-| `GET`  | `/users?limit=&offset=` | ดูรายชื่อผู้ใช้แบบ paginated |
+| `GET`  | `/users?limit=&offset=` | ดูรายชื่อผู้ใช้ (paginated) |
 | `GET`  | `/landing` | หน้า personalized (LIFF) |
 
-### ตัวอย่าง: ส่ง Broadcast (แนะนำ — 1 API call)
-
+### ตัวอย่าง: Broadcast (แนะนำ — 1 call)
 ```bash
-curl -X POST https://your-server-domain.com/broadcast \
+curl -X POST https://your-domain.com/broadcast \
   -H "Content-Type: application/json" \
-  -d '{
-    "mode": "broadcast",
-    "message": "สวัสดี! แตะลิ้งนี้เพื่อดูข้อมูลเฉพาะของคุณ: {link}"
-  }'
+  -d '{"mode":"broadcast","message":"สวัสดี! ดูข้อมูลของคุณ: {link}"}'
 ```
 
-### ตัวอย่าง: ส่ง Multicast (เฉพาะ registered users)
-
+### ตัวอย่าง: Narrowcast (registered users + LINE-side delivery)
 ```bash
-curl -X POST https://your-server-domain.com/broadcast \
+curl -X POST https://your-domain.com/broadcast \
   -H "Content-Type: application/json" \
-  -d '{
-    "mode": "multicast",
-    "concurrency": 50
-  }'
+  -d '{"mode":"narrowcast","concurrency":50}'
 ```
 
-### ตัวอย่าง: ส่ง Push (ลิ้ง unique ใน message)
-
+### ตัวอย่าง: Push (ลิ้ง unique ใน message)
 ```bash
-curl -X POST https://your-server-domain.com/broadcast \
+curl -X POST https://your-domain.com/broadcast \
   -H "Content-Type: application/json" \
-  -d '{
-    "mode": "push",
-    "message": "ลิ้งเฉพาะของคุณ: {link}"
-  }'
+  -d '{"mode":"push","message":"ลิ้งเฉพาะของคุณ: {link}"}'
 ```
 
 Response (ทันที):
 ```json
 {
   "jobId": "uuid-...",
-  "mode": "broadcast",
-  "total": 1500000,
-  "apiCalls": 1,
-  "message": "Broadcast started — 1 broadcast call (all followers)",
+  "mode": "narrowcast",
+  "total": 13000000,
+  "apiCalls": 9,
+  "message": "Broadcast started — 9 narrowcast calls (via 9 audience groups)",
   "statusUrl": "/broadcast/status/uuid-..."
 }
 ```
@@ -145,8 +135,8 @@ Response (ทันที):
 ├── index.html       # LIFF frontend
 ├── index.js         # LIFF JavaScript
 ├── style.css        # Styles
-├── users.db         # SQLite database (ถูก gitignore)
-├── .env.example     # Template ตัวแปรสภาพแวดล้อม
+├── users.db         # SQLite database (gitignored)
+├── .env.example     # Template credentials
 └── package.json
 ```
 

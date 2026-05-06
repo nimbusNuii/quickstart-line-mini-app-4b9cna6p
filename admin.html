@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Admin — LINE Mini App</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: sans-serif; margin: 0; background: #f5f7fa; color: #222; }
+    header { background: #00b900; color: #fff; padding: 14px 24px; display: flex; align-items: center; gap: 12px; }
+    header h1 { margin: 0; font-size: 1.2rem; }
+    nav { display: flex; background: #fff; border-bottom: 2px solid #e0e0e0; padding: 0 24px; }
+    nav button { background: none; border: none; padding: 12px 20px; cursor: pointer; font-size: 0.95rem; color: #555; border-bottom: 3px solid transparent; margin-bottom: -2px; }
+    nav button.active { color: #00b900; border-bottom-color: #00b900; font-weight: 600; }
+    .tab { display: none; padding: 24px; }
+    .tab.active { display: block; }
+    .card { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+    h2 { margin: 0 0 16px; font-size: 1.05rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th { background: #f0f0f0; text-align: left; padding: 8px 10px; }
+    td { padding: 7px 10px; border-bottom: 1px solid #eee; word-break: break-all; }
+    tr:hover td { background: #fafafa; }
+    input, select { padding: 7px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 0.9rem; }
+    button.btn { background: #00b900; color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+    button.btn:hover { background: #009900; }
+    button.btn.danger { background: #d00; }
+    button.btn.outline { background: #fff; color: #00b900; border: 1px solid #00b900; }
+    button.btn.outline:hover { background: #e8ffe8; }
+    button.btn.small { padding: 5px 10px; font-size: 0.82rem; }
+    .filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; align-items: center; }
+    .filters label { font-size: 0.85rem; color: #666; }
+    .pagination { display: flex; gap: 8px; margin-top: 12px; align-items: center; font-size: 0.9rem; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.78rem; background: #e8f5e9; color: #2e7d32; font-weight: 600; }
+    .badge.red { background: #fdecea; color: #c62828; }
+    .badge.grey { background: #eee; color: #555; }
+    .form-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; align-items: flex-end; }
+    .form-row label { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: #555; }
+    #toast { position: fixed; bottom: 24px; right: 24px; background: #333; color: #fff; padding: 10px 18px; border-radius: 8px; display: none; font-size: 0.9rem; z-index: 999; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .summary-card { background: #fff; border-radius: 8px; padding: 14px 16px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .summary-card .num { font-size: 1.6rem; font-weight: 700; color: #00b900; }
+    .summary-card .label { font-size: 0.78rem; color: #888; margin-top: 2px; }
+    .empty { color: #999; font-size: 0.9rem; text-align: center; padding: 20px; }
+    .seg-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 100; justify-content: center; align-items: center; }
+    .modal-bg.open { display: flex; }
+    .modal { background: #fff; border-radius: 12px; padding: 24px; width: 90%; max-width: 440px; }
+    .modal h3 { margin: 0 0 16px; }
+  </style>
+</head>
+<body>
+<header>
+  <span style="font-size:1.4rem;">🟢</span>
+  <h1>LINE Mini App — Admin Dashboard</h1>
+</header>
+
+<nav>
+  <button class="active" onclick="showTab('logs', this)">📋 Logs</button>
+  <button onclick="showTab('segments', this)">🎯 Segments</button>
+  <button onclick="showTab('richmenus', this)">📌 Rich Menus</button>
+</nav>
+
+<!-- ═══ TAB: LOGS ══════════════════════════════════════════════════════════════ -->
+<div id="tab-logs" class="tab active">
+  <div class="card">
+    <h2>สรุป Events</h2>
+    <div id="summaryGrid" class="summary-grid"><div class="empty">กำลังโหลด...</div></div>
+  </div>
+  <div class="card">
+    <h2>Log ทั้งหมด</h2>
+    <div class="filters">
+      <label>Event<br><select id="fEvent" onchange="loadLogs()">
+        <option value="">ทั้งหมด</option>
+      </select></label>
+      <label>User ID<br><input id="fUserId" placeholder="Uxxx..." oninput="debounceLoadLogs()"></label>
+      <label>ตั้งแต่<br><input type="date" id="fSince" onchange="loadLogs()"></label>
+      <label>ถึง<br><input type="date" id="fUntil" onchange="loadLogs()"></label>
+      <button class="btn outline" onclick="loadLogs()">🔍 ค้นหา</button>
+      <button class="btn outline" onclick="clearLogFilters()">✖ ล้าง</button>
+    </div>
+    <table>
+      <thead><tr><th>#</th><th>userId</th><th>Event</th><th>Props</th><th>เวลา</th></tr></thead>
+      <tbody id="logBody"><tr><td colspan="5" class="empty">กำลังโหลด...</td></tr></tbody>
+    </table>
+    <div class="pagination">
+      <button class="btn outline small" id="logPrev" onclick="logPage(-1)">← ก่อนหน้า</button>
+      <span id="logPageInfo">—</span>
+      <button class="btn outline small" id="logNext" onclick="logPage(1)">ถัดไป →</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ TAB: SEGMENTS ══════════════════════════════════════════════════════════ -->
+<div id="tab-segments" class="tab">
+  <div class="card">
+    <h2>สร้าง Segment ใหม่</h2>
+    <div class="form-row">
+      <label>ชื่อ Segment<br><input id="segName" placeholder="เช่น ผู้ใช้ที่ลงทะเบียนใน 7 วัน"></label>
+      <label>Event<br><select id="segEvent">
+        <option value="">ทุก event</option>
+        <option value="register">register</option>
+        <option value="follow">follow</option>
+        <option value="message">message</option>
+        <option value="page_view">page_view</option>
+        <option value="link_click">link_click</option>
+        <option value="unfollow">unfollow</option>
+      </select></label>
+      <label>ตั้งแต่<br><input type="date" id="segSince"></label>
+      <label>ถึง<br><input type="date" id="segUntil"></label>
+      <label>ขั้นต่ำ (ครั้ง)<br><input type="number" id="segMinCount" value="1" min="1" style="width:80px"></label>
+      <button class="btn" onclick="createSegment()">+ สร้าง Segment</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Segments ที่มีอยู่</h2>
+    <div id="segList"><div class="empty">กำลังโหลด...</div></div>
+  </div>
+</div>
+
+<!-- ═══ TAB: RICH MENUS ════════════════════════════════════════════════════════ -->
+<div id="tab-richmenus" class="tab">
+  <div class="card">
+    <h2>Rich Menus ใน LINE Channel</h2>
+    <button class="btn outline" onclick="loadRichMenus()" style="margin-bottom:16px;">🔄 รีเฟรช</button>
+    <div id="rmList"><div class="empty">กำลังโหลด...</div></div>
+  </div>
+</div>
+
+<!-- Modal: เลือก Segment สำหรับติด Rich Menu -->
+<div class="modal-bg" id="rmModal">
+  <div class="modal">
+    <h3>📌 ติด Rich Menu ไปยัง Segment</h3>
+    <p id="rmModalMenuName" style="font-size:0.9rem;color:#555;"></p>
+    <input type="hidden" id="rmModalMenuId">
+    <label style="font-size:0.85rem;">เลือก Segment<br>
+      <select id="rmSegSelect" style="width:100%;margin-top:6px;padding:8px;border:1px solid #ccc;border-radius:6px;"></select>
+    </label>
+    <div style="display:flex;gap:10px;margin-top:16px;justify-content:flex-end;">
+      <button class="btn outline" onclick="closeRmModal()">ยกเลิก</button>
+      <button class="btn" onclick="doLinkRichmenu()">✅ ยืนยันติด Rich Menu</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function showTab(name, btn) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  btn.classList.add('active');
+  if (name === 'logs') { loadSummary(); loadLogs(); }
+  if (name === 'segments') loadSegments();
+  if (name === 'richmenus') loadRichMenus();
+}
+
+function toast(msg, err) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.background = err ? '#c62828' : '#333';
+  el.style.display = 'block';
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => { el.style.display = 'none'; }, 3000);
+}
+
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Error');
+  return data;
+}
+
+function fmtDate(iso) {
+  if (!iso) return '—';
+  return iso.replace('T', ' ').slice(0, 19);
+}
+
+function escHtml(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function escAttr(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ─── LOGS ─────────────────────────────────────────────────────────────────────
+let logOffset = 0;
+const LOG_LIMIT = 50;
+let logDebounce;
+
+function debounceLoadLogs() {
+  clearTimeout(logDebounce);
+  logDebounce = setTimeout(loadLogs, 400);
+}
+
+function clearLogFilters() {
+  document.getElementById('fEvent').value = '';
+  document.getElementById('fUserId').value = '';
+  document.getElementById('fSince').value = '';
+  document.getElementById('fUntil').value = '';
+  logOffset = 0;
+  loadLogs();
+}
+
+function logPage(dir) {
+  logOffset = Math.max(0, logOffset + dir * LOG_LIMIT);
+  loadLogs(false);
+}
+
+async function loadSummary() {
+  const grid = document.getElementById('summaryGrid');
+  try {
+    const rows = await api('GET', '/logs/summary');
+    if (!rows.length) { grid.innerHTML = '<div class="empty">ยังไม่มี events</div>'; return; }
+    grid.innerHTML = rows.map(r => `
+      <div class="summary-card">
+        <div class="num">${r.cnt.toLocaleString()}</div>
+        <div class="label">${escHtml(r.event)}</div>
+        <div style="font-size:0.75rem;color:#aaa;margin-top:2px;">${r.users.toLocaleString()} users</div>
+      </div>`).join('');
+  } catch(e) { grid.innerHTML = `<div class="empty">Error: ${e.message}</div>`; }
+}
+
+async function loadLogs(resetOffset = true) {
+  if (resetOffset) logOffset = 0;
+  const event  = document.getElementById('fEvent').value;
+  const userId = document.getElementById('fUserId').value.trim();
+  const since  = document.getElementById('fSince').value;
+  const until  = document.getElementById('fUntil').value;
+  const qs = new URLSearchParams({ limit: LOG_LIMIT, offset: logOffset });
+  if (event)  qs.set('event', event);
+  if (userId) qs.set('userId', userId);
+  if (since)  qs.set('since', since);
+  if (until)  qs.set('until', until + 'T23:59:59');
+
+  const tbody = document.getElementById('logBody');
+  tbody.innerHTML = '<tr><td colspan="5" class="empty">กำลังโหลด...</td></tr>';
+  try {
+    const data = await api('GET', '/logs?' + qs);
+
+    // populate event filter dropdown
+    const sel = document.getElementById('fEvent');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">ทั้งหมด</option>' + data.events.map(e => `<option${cur===e?' selected':''}>${escHtml(e)}</option>`).join('');
+    sel.value = cur;
+
+    if (!data.rows.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">ไม่พบข้อมูล</td></tr>';
+    } else {
+      tbody.innerHTML = data.rows.map(r => `<tr>
+        <td>${r.id}</td>
+        <td><span style="font-family:monospace;font-size:0.82rem;">${escHtml(r.userId)}</span></td>
+        <td><span class="badge">${escHtml(r.event)}</span></td>
+        <td style="font-size:0.8rem;color:#666;">${r.props ? escHtml(r.props) : '—'}</td>
+        <td style="white-space:nowrap;">${fmtDate(r.createdAt)}</td>
+      </tr>`).join('');
+    }
+    const page = Math.floor(logOffset / LOG_LIMIT) + 1;
+    const total = data.total;
+    document.getElementById('logPageInfo').textContent = `${logOffset+1}–${Math.min(logOffset+LOG_LIMIT, total)} / ${total.toLocaleString()}`;
+    document.getElementById('logPrev').disabled = logOffset === 0;
+    document.getElementById('logNext').disabled = logOffset + LOG_LIMIT >= total;
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty">Error: ${e.message}</td></tr>`;
+  }
+}
+
+// ─── SEGMENTS ─────────────────────────────────────────────────────────────────
+async function createSegment() {
+  const name = document.getElementById('segName').value.trim();
+  if (!name) { toast('กรุณาใส่ชื่อ Segment', true); return; }
+  const criteria = {};
+  const ev = document.getElementById('segEvent').value;
+  const since = document.getElementById('segSince').value;
+  const until = document.getElementById('segUntil').value;
+  const minCount = parseInt(document.getElementById('segMinCount').value) || 1;
+  if (ev) criteria.event = ev;
+  if (since) criteria.since = since;
+  if (until) criteria.until = until + 'T23:59:59';
+  if (minCount > 1) criteria.minCount = minCount;
+  try {
+    await api('POST', '/segments', { name, criteria });
+    toast('สร้าง Segment สำเร็จ ✅');
+    document.getElementById('segName').value = '';
+    loadSegments();
+  } catch(e) { toast(e.message, true); }
+}
+
+async function loadSegments() {
+  const el = document.getElementById('segList');
+  el.innerHTML = '<div class="empty">กำลังโหลด...</div>';
+  try {
+    const segs = await api('GET', '/segments');
+    if (!segs.length) { el.innerHTML = '<div class="empty">ยังไม่มี Segment</div>'; return; }
+    el.innerHTML = `<table>
+      <thead><tr><th>#</th><th>ชื่อ</th><th>เงื่อนไข</th><th>สร้างเมื่อ</th><th>จำนวน Users</th><th>Actions</th></tr></thead>
+      <tbody>${segs.map(s => `
+        <tr id="seg-row-${s.id}">
+          <td>${s.id}</td>
+          <td><b>${escHtml(s.name)}</b></td>
+          <td><code style="font-size:0.8rem;">${escHtml(JSON.stringify(s.criteria))}</code></td>
+          <td style="white-space:nowrap;">${fmtDate(s.createdAt)}</td>
+          <td id="seg-cnt-${s.id}"><button class="btn outline small" data-action="preview" data-id="${s.id}">ดู Users</button></td>
+          <td>
+            <div class="seg-actions">
+              <button class="btn small" data-action="audience" data-id="${s.id}">📢 สร้าง Audience</button>
+              <button class="btn outline small" data-action="richmenu" data-id="${s.id}" data-name="${escAttr(s.name)}">📌 ติด Rich Menu</button>
+              <button class="btn danger small" data-action="delete" data-id="${s.id}">🗑</button>
+            </div>
+          </td>
+        </tr>`).join('')}
+      </tbody></table>`;
+    el.querySelector('table').addEventListener('click', function(e) {
+      const btn = e.target.closest('[data-action]');
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const action = btn.dataset.action;
+      if (action === 'preview') previewSegment(id);
+      else if (action === 'audience') createAudienceFromSegment(id);
+      else if (action === 'richmenu') openRmModal(id, btn.dataset.name || '');
+      else if (action === 'delete') deleteSegment(id);
+    });
+  } catch(e) { el.innerHTML = `<div class="empty">Error: ${escHtml(e.message)}</div>`; }
+}
+
+async function previewSegment(id) {
+  const el = document.getElementById('seg-cnt-' + id);
+  el.textContent = 'กำลังนับ...';
+  try {
+    const data = await api('GET', '/segments/' + id + '/users');
+    el.innerHTML = `<b>${data.userCount.toLocaleString()}</b> คน`;
+  } catch(e) { el.textContent = 'Error'; toast(e.message, true); }
+}
+
+async function createAudienceFromSegment(id) {
+  if (!confirm('ต้องการสร้าง LINE Audience จาก Segment นี้?')) return;
+  toast('กำลังสร้าง Audience...');
+  try {
+    const data = await api('POST', '/segments/' + id + '/audience');
+    toast(`✅ Audience สร้างแล้ว! ID: ${data.audienceGroupId} (${data.userCount} users)`);
+  } catch(e) { toast(e.message, true); }
+}
+
+async function deleteSegment(id) {
+  if (!confirm('ต้องการลบ Segment นี้?')) return;
+  try {
+    await api('DELETE', '/segments/' + id);
+    toast('ลบแล้ว');
+    loadSegments();
+  } catch(e) { toast(e.message, true); }
+}
+
+// ─── RICH MENUS ───────────────────────────────────────────────────────────────
+async function loadRichMenus() {
+  const el = document.getElementById('rmList');
+  el.innerHTML = '<div class="empty">กำลังโหลด...</div>';
+  try {
+    const menus = await api('GET', '/richmenus');
+    if (!menus.length) { el.innerHTML = '<div class="empty">ไม่พบ Rich Menu ใน Channel นี้</div>'; return; }
+    el.innerHTML = `<table>
+      <thead><tr><th>richMenuId</th><th>ชื่อ</th><th>ขนาด</th><th>Actions</th></tr></thead>
+      <tbody>${menus.map(m => `
+        <tr>
+          <td><code style="font-size:0.8rem;">${escHtml(m.richMenuId)}</code></td>
+          <td>${escHtml(m.name)}</td>
+          <td>${Number(m.size?.width)}×${Number(m.size?.height)}</td>
+          <td><button class="btn small" data-action="link-rm" data-rm-id="${escAttr(m.richMenuId)}" data-rm-name="${escAttr(m.name)}">📌 ติดกับ Segment</button></td>
+        </tr>`).join('')}
+      </tbody></table>`;
+    el.querySelector('table').addEventListener('click', function(e) {
+      const btn = e.target.closest('[data-action="link-rm"]');
+      if (!btn) return;
+      openRmModalWithMenu(btn.dataset.rmId, btn.dataset.rmName);
+    });
+  } catch(e) { el.innerHTML = `<div class="empty">Error: ${escHtml(e.message)}</div>`; }
+}
+
+async function openRmModalWithMenu(richMenuId, menuName) {
+  document.getElementById('rmModalMenuId').value = richMenuId;
+  document.getElementById('rmModalMenuName').textContent = `Rich Menu: ${menuName}`;
+  await populateRmSegSelect();
+  document.getElementById('rmModal').classList.add('open');
+}
+
+async function openRmModal(segId, segName) {
+  // called from segment tab — pick rich menu
+  document.getElementById('rmModalMenuId').value = '';
+  document.getElementById('rmModalMenuName').textContent = `Segment: ${segName}`;
+  await populateRmSegSelect(segId);
+
+  // Also pre-populate rich menu options into a hidden select (reuse rmSegSelect for menu pick)
+  // Simpler: just ask user to go to Rich Menus tab for this flow
+  // Instead: repurpose modal to pick richMenuId
+  const rmIdInput = document.createElement('input');
+  rmIdInput.id = 'rmDirectMenuId';
+  rmIdInput.placeholder = 'ใส่ richMenuId...';
+  rmIdInput.style.cssText = 'width:100%;margin-top:10px;padding:8px;border:1px solid #ccc;border-radius:6px;';
+  const modal = document.querySelector('.modal');
+  const existing = document.getElementById('rmDirectMenuId');
+  if (existing) existing.remove();
+  document.getElementById('rmSegSelect').parentElement.after(rmIdInput);
+  document.getElementById('rmModal').classList.add('open');
+}
+
+async function populateRmSegSelect(selectedId) {
+  const sel = document.getElementById('rmSegSelect');
+  sel.innerHTML = '<option value="">กำลังโหลด...</option>';
+  try {
+    const segs = await api('GET', '/segments');
+    sel.innerHTML = segs.map(s => `<option value="${s.id}"${s.id==selectedId?' selected':''}>${s.name} (#${s.id})</option>`).join('');
+  } catch(e) { sel.innerHTML = '<option>Error</option>'; }
+}
+
+function closeRmModal() {
+  document.getElementById('rmModal').classList.remove('open');
+  const ex = document.getElementById('rmDirectMenuId');
+  if (ex) ex.remove();
+}
+
+async function doLinkRichmenu() {
+  const segId = document.getElementById('rmSegSelect').value;
+  let richMenuId = document.getElementById('rmModalMenuId').value;
+  const direct = document.getElementById('rmDirectMenuId');
+  if (direct && direct.value.trim()) richMenuId = direct.value.trim();
+  if (!richMenuId) { toast('กรุณาใส่ richMenuId', true); return; }
+  if (!segId) { toast('กรุณาเลือก Segment', true); return; }
+  closeRmModal();
+  toast('กำลังติด Rich Menu...');
+  try {
+    const data = await api('POST', '/segments/' + segId + '/richmenu', { richMenuId });
+    toast(`✅ ติด Rich Menu สำเร็จ ${data.linked.toLocaleString()} users${data.failed ? ` (ผิดพลาด ${data.failed})` : ''}`);
+  } catch(e) { toast(e.message, true); }
+}
+
+// Close modal on background click
+document.getElementById('rmModal').addEventListener('click', function(e) {
+  if (e.target === this) closeRmModal();
+});
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+loadSummary();
+loadLogs();
+</script>
+</body>
+</html>

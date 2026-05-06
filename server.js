@@ -41,6 +41,25 @@ db.exec(`
     startedAt   TEXT,
     finishedAt  TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS user_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    userId    TEXT NOT NULL,
+    event     TEXT NOT NULL,
+    props     TEXT,
+    createdAt TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_ue_userId    ON user_events(userId);
+  CREATE INDEX IF NOT EXISTS idx_ue_event     ON user_events(event);
+  CREATE INDEX IF NOT EXISTS idx_ue_createdAt ON user_events(createdAt);
+
+  CREATE TABLE IF NOT EXISTS segments (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    name      TEXT NOT NULL,
+    criteria  TEXT NOT NULL,
+    createdAt TEXT NOT NULL
+  );
 `);
 
 // Add filter column to existing databases (safe no-op if already present)
@@ -68,6 +87,44 @@ const stmtIncrJob     = db.prepare(`
 `);
 const stmtGetJob      = db.prepare(`SELECT * FROM broadcast_jobs WHERE jobId = @jobId`);
 const stmtListJobs    = db.prepare(`SELECT * FROM broadcast_jobs ORDER BY startedAt DESC LIMIT 20`);
+
+const stmtInsertEvent = db.prepare(`
+  INSERT INTO user_events (userId, event, props, createdAt)
+  VALUES (@userId, @event, @props, @createdAt)
+`);
+const stmtInsertSegment = db.prepare(`
+  INSERT INTO segments (name, criteria, createdAt) VALUES (@name, @criteria, @createdAt)
+`);
+const stmtGetSegment  = db.prepare(`SELECT * FROM segments WHERE id = @id`);
+const stmtListSegments = db.prepare(`SELECT * FROM segments ORDER BY createdAt DESC`);
+const stmtDeleteSegment = db.prepare(`DELETE FROM segments WHERE id = @id`);
+
+function logEvent(userId, event, props) {
+  stmtInsertEvent.run({ userId, event, props: props ? JSON.stringify(props) : null, createdAt: new Date().toISOString() });
+}
+
+// Build WHERE clause from segment criteria
+// criteria = { event?, since?, until?, minCount? }
+function buildSegmentQuery(criteria) {
+  const conds = [];
+  const params = [];
+  if (criteria.event)  { conds.push(`event = ?`);       params.push(criteria.event); }
+  if (criteria.since)  { conds.push(`createdAt >= ?`);   params.push(criteria.since); }
+  if (criteria.until)  { conds.push(`createdAt <= ?`);   params.push(criteria.until); }
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  const minCount = parseInt(criteria.minCount) || 1;
+  const sql = `
+    SELECT userId, COUNT(*) as cnt FROM user_events ${where}
+    GROUP BY userId HAVING cnt >= ?
+  `;
+  params.push(minCount);
+  return { sql, params };
+}
+
+function getSegmentUsers(criteria) {
+  const { sql, params } = buildSegmentQuery(criteria);
+  return db.prepare(sql).all(...params).map((r) => r.userId);
+}
 
 function newToken() { return crypto.randomUUID(); }
 
@@ -335,8 +392,10 @@ app.post(
       if (!uid) continue;
       if (event.type === 'follow' || event.type === 'message') {
         stmtUpsertUser.run({ userId: uid, token: newToken(), createdAt: new Date().toISOString() });
+        logEvent(uid, event.type, event.type === 'message' ? { messageType: event.message?.type } : null);
       } else if (event.type === 'unfollow') {
         stmtDeleteUser.run({ userId: uid });
+        logEvent(uid, 'unfollow', null);
       }
     }
     res.sendStatus(200);
@@ -351,6 +410,7 @@ app.post('/register', (req, res) => {
   if (!userId) return res.status(400).json({ error: 'userId is required' });
 
   stmtUpsertUser.run({ userId, token: newToken(), createdAt: new Date().toISOString() });
+  logEvent(userId, 'register', null);
   const user = stmtGetUser.get({ userId });
   const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
   const link = `${baseUrl}/landing`;
@@ -482,7 +542,159 @@ app.get('/users', (req, res) => {
   res.json({ total: cnt, limit, offset, count: users.length, users });
 });
 
-// ─── Landing page (personalised via LIFF) ─────────────────────────────────────
+// ─── Event log (called from LIFF pages) ──────────────────────────────────────
+// POST /log  { userId, event, props? }
+// Rate-limited: max 60 events per userId per minute
+const _logRateMap = new Map();
+function _checkLogRate(userId) {
+  const now = Date.now();
+  const entry = _logRateMap.get(userId);
+  if (!entry || now > entry.resetAt) {
+    _logRateMap.set(userId, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  if (entry.count >= 60) return false;
+  entry.count++;
+  return true;
+}
+// Periodically clean up expired rate limit entries
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _logRateMap) if (now > v.resetAt) _logRateMap.delete(k);
+}, 120_000);
+
+app.post('/log', (req, res) => {
+  const { userId, event, props } = req.body;
+  if (!userId || !event) return res.status(400).json({ error: 'userId and event are required' });
+  if (!_checkLogRate(userId)) return res.status(429).json({ error: 'Too many events' });
+  logEvent(userId, event, props || null);
+  res.json({ ok: true });
+});
+
+// GET /logs?event=&userId=&since=&until=&limit=&offset=
+app.get('/logs', (req, res) => {
+  const limit  = Math.min(parseInt(req.query.limit) || 100, 1000);
+  const offset = parseInt(req.query.offset) || 0;
+  const conds = [], params = [];
+  if (req.query.userId) { conds.push(`userId = ?`);      params.push(req.query.userId); }
+  if (req.query.event)  { conds.push(`event = ?`);       params.push(req.query.event); }
+  if (req.query.since)  { conds.push(`createdAt >= ?`);  params.push(req.query.since); }
+  if (req.query.until)  { conds.push(`createdAt <= ?`);  params.push(req.query.until); }
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  const rows = db.prepare(`SELECT * FROM user_events ${where} ORDER BY createdAt DESC LIMIT ? OFFSET ?`).all(...params, limit, offset);
+  const { total } = db.prepare(`SELECT COUNT(*) as total FROM user_events ${where}`).get(...params);
+  const events = db.prepare(`SELECT DISTINCT event FROM user_events ORDER BY event`).pluck().all();
+  res.json({ total, limit, offset, count: rows.length, rows, events });
+});
+
+// GET /logs/summary — event counts per type
+app.get('/logs/summary', (_req, res) => {
+  const rows = db.prepare(`SELECT event, COUNT(*) as cnt, COUNT(DISTINCT userId) as users FROM user_events GROUP BY event ORDER BY cnt DESC`).all();
+  res.json(rows);
+});
+
+// ─── Segments ─────────────────────────────────────────────────────────────────
+// POST /segments  { name, criteria: { event?, since?, until?, minCount? } }
+app.post('/segments', (req, res) => {
+  const { name, criteria } = req.body;
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  const c = criteria || {};
+  const info = stmtInsertSegment.run({ name, criteria: JSON.stringify(c), createdAt: new Date().toISOString() });
+  res.json({ id: info.lastInsertRowid, name, criteria: c });
+});
+
+// GET /segments
+app.get('/segments', (_req, res) => {
+  const rows = stmtListSegments.all().map((s) => ({ ...s, criteria: JSON.parse(s.criteria) }));
+  res.json(rows);
+});
+
+// GET /segments/:id/users — preview users in segment
+app.get('/segments/:id/users', (req, res) => {
+  const seg = stmtGetSegment.get({ id: req.params.id });
+  if (!seg) return res.status(404).json({ error: 'Segment not found' });
+  const criteria = JSON.parse(seg.criteria);
+  const users = getSegmentUsers(criteria);
+  res.json({ segmentId: seg.id, name: seg.name, userCount: users.length, users });
+});
+
+// DELETE /segments/:id
+app.delete('/segments/:id', (req, res) => {
+  stmtDeleteSegment.run({ id: req.params.id });
+  res.json({ ok: true });
+});
+
+// POST /segments/:id/audience — create LINE Audience from segment users
+app.post('/segments/:id/audience', async (req, res) => {
+  const seg = stmtGetSegment.get({ id: req.params.id });
+  if (!seg) return res.status(404).json({ error: 'Segment not found' });
+  const criteria = JSON.parse(seg.criteria);
+  const users = getSegmentUsers(criteria);
+  if (users.length === 0) return res.status(400).json({ error: 'No users in segment' });
+
+  try {
+    const created = await lineApi('POST', '/v2/bot/audienceGroup/upload', {
+      description: `seg_${seg.id}_${seg.name}`.slice(0, 120),
+      isIfaAudience: false,
+    });
+    const audienceGroupId = created.audienceGroupId;
+
+    // Upload in batches of 10K
+    for (let i = 0; i < users.length; i += AUDIENCE_UPLOAD) {
+      await lineApi('PUT', '/v2/bot/audienceGroup/upload', {
+        audienceGroupId,
+        audiences: users.slice(i, i + AUDIENCE_UPLOAD).map((id) => ({ id })),
+      });
+    }
+    res.json({ audienceGroupId, userCount: users.length, segmentName: seg.name });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// POST /segments/:id/richmenu  { richMenuId }
+// Bulk-links a Rich Menu to every user in the segment (500 users/call)
+app.post('/segments/:id/richmenu', async (req, res) => {
+  const { richMenuId } = req.body;
+  if (!richMenuId) return res.status(400).json({ error: 'richMenuId is required' });
+
+  const seg = stmtGetSegment.get({ id: req.params.id });
+  if (!seg) return res.status(404).json({ error: 'Segment not found' });
+  const criteria = JSON.parse(seg.criteria);
+  const users = getSegmentUsers(criteria);
+  if (users.length === 0) return res.status(400).json({ error: 'No users in segment' });
+
+  const BATCH = 500;
+  let linked = 0, failed = 0;
+  for (let i = 0; i < users.length; i += BATCH) {
+    try {
+      await lineApi('POST', '/v2/bot/richmenu/bulk/link', {
+        richMenuId,
+        userIds: users.slice(i, i + BATCH),
+      });
+      linked += Math.min(BATCH, users.length - i);
+    } catch (err) {
+      console.error(`richmenu bulk link batch ${i} failed: ${err.message}`);
+      failed += Math.min(BATCH, users.length - i);
+    }
+  }
+  res.json({ richMenuId, segmentName: seg.name, userCount: users.length, linked, failed });
+});
+
+// GET /richmenus — list rich menus from LINE
+app.get('/richmenus', async (_req, res) => {
+  try {
+    const data = await lineApi('GET', '/v2/bot/richmenu/list');
+    res.json(data?.richmenus || []);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// ─── Admin dashboard ──────────────────────────────────────────────────────────
+app.get('/admin', (_req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
+
+
 // Everyone gets the same URL. The page calls liff.getProfile() to identify
 // the visitor, then fetches /my-link?userId=... to get their personal data.
 app.get('/landing', (req, res) => {
@@ -521,8 +733,23 @@ app.get('/landing', (req, res) => {
         if (!res.ok) throw new Error(await res.text());
         const data = await res.json();
 
+        // Log page_view event for segment building
+        fetch('/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: profile.userId, event: 'page_view', props: { page: 'landing' } }),
+        }).catch(() => {});
+
         document.getElementById('personalLink').textContent = data.link;
         document.getElementById('personalLink').href = data.link;
+        // Log link_click when user taps the link
+        document.getElementById('personalLink').addEventListener('click', function() {
+          fetch('/log', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: profile.userId, event: 'link_click', props: { page: 'landing' } }),
+          }).catch(() => {});
+        });
         document.getElementById('tokenInfo').textContent = 'Token: ' + data.token;
         document.getElementById('loading').style.display = 'none';
         document.getElementById('content').style.display = 'block';

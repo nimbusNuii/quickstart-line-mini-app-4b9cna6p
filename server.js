@@ -37,10 +37,15 @@ db.exec(`
     failed      INTEGER NOT NULL DEFAULT 0,
     message     TEXT,
     baseUrl     TEXT,
+    filter      TEXT,
     startedAt   TEXT,
     finishedAt  TEXT
   );
 `);
+
+// Add filter column to existing databases (safe no-op if already present)
+try { db.exec(`ALTER TABLE broadcast_jobs ADD COLUMN filter TEXT`); } catch {}
+
 
 const stmtUpsertUser = db.prepare(`
   INSERT OR IGNORE INTO users (userId, token, createdAt)
@@ -50,8 +55,8 @@ const stmtDeleteUser  = db.prepare(`DELETE FROM users WHERE userId = @userId`);
 const stmtGetUser     = db.prepare(`SELECT * FROM users WHERE userId = @userId`);
 const stmtCountUsers  = db.prepare(`SELECT COUNT(*) as cnt FROM users`);
 const stmtInsertJob   = db.prepare(`
-  INSERT INTO broadcast_jobs (jobId, status, total, sent, failed, message, baseUrl, startedAt)
-  VALUES (@jobId, 'pending', @total, 0, 0, @message, @baseUrl, @startedAt)
+  INSERT INTO broadcast_jobs (jobId, status, total, sent, failed, message, baseUrl, filter, startedAt)
+  VALUES (@jobId, 'pending', @total, 0, 0, @message, @baseUrl, @filter, @startedAt)
 `);
 const stmtUpdateJob   = db.prepare(`
   UPDATE broadcast_jobs
@@ -96,6 +101,39 @@ async function waitForAudience(audienceGroupId) {
     if (status === 'FAILED') throw new Error(`Audience ${audienceGroupId} failed`);
     await new Promise((r) => setTimeout(r, AUDIENCE_POLL_MS));
   }
+}
+
+// ─── Build LINE demographic recipient from user-friendly filter object ─────────
+// filter = { gender?, ageMin?, ageMax?, os? }
+//   gender  : "male" | "female"
+//   ageMin  : "age_15"|"age_20"|"age_25"|"age_30"|"age_35"|"age_40"|"age_45"|"age_50"
+//   ageMax  : same values as ageMin
+//   os      : "ios" | "android"
+// Returns null if no filter fields are set.
+function buildDemographicRecipient(filter) {
+  if (!filter) return null;
+  const conditions = [];
+  if (filter.gender) {
+    conditions.push({ type: 'demographic', demographicFilterType: 'gender', gte: filter.gender });
+  }
+  if (filter.ageMin || filter.ageMax) {
+    const cond = { type: 'demographic', demographicFilterType: 'age' };
+    if (filter.ageMin) cond.gte = filter.ageMin;
+    if (filter.ageMax) cond.lt  = filter.ageMax;
+    conditions.push(cond);
+  }
+  if (filter.os) {
+    conditions.push({ type: 'demographic', demographicFilterType: 'appType', gte: filter.os });
+  }
+  if (conditions.length === 0) return null;
+  return conditions.length === 1 ? conditions[0] : { type: 'operator', and: conditions };
+}
+
+// Merge an audience recipient with a demographic recipient (AND logic)
+function mergeRecipients(audienceRecipient, demographicRecipient) {
+  if (!demographicRecipient) return audienceRecipient;
+  if (!audienceRecipient)    return demographicRecipient;
+  return { type: 'operator', and: [audienceRecipient, demographicRecipient] };
 }
 
 // ─── Broadcast runner: LINE Broadcast API (1 call, all followers) ─────────────
@@ -191,33 +229,45 @@ async function runPushJob(jobId, baseUrl, messageTemplate, concurrency) {
 
 // ─── Broadcast runner: Narrowcast via Audience (registered users, LINE-side delivery) ──
 //
-// Flow for 13M users:
-//   1. Chunk users into groups of 1.5M   → 9 audience groups
-//   2. Upload each group in parallel 10K-user batches → ~1,300 API calls
-//   3. Poll until all audiences are READY (LINE processes them async)
-//   4. Narrowcast sequentially (LINE allows 1 active narrowcast at a time)
-//   5. Delete audience groups (cleanup)
+// Two paths depending on whether registered userIds are needed:
 //
-// Why use narrowcast vs multicast?
-//   - LINE delivers on their side — our server is free after step 4
-//   - Supports demographic/OS filtering (extend recipient object as needed)
-//   - For 13M: ~9 narrowcast calls vs 26,000 multicast calls
-async function runNarrowcastJob(jobId, baseUrl, messageTemplate, uploadConcurrency) {
+// A) filter only (no audience upload needed) → 1 narrowcast call, instant
+//    e.g. { gender: 'male', ageMin: 'age_20', ageMax: 'age_35', os: 'ios' }
+//
+// B) registered users (+ optional demographic filter) → audience upload path
+//    13M users → 9 audience groups, upload 1,300 batches in parallel, then 9 narrowcast calls
+//
+// Personalisation via LIFF on landing page in both cases.
+async function runNarrowcastJob(jobId, baseUrl, messageTemplate, uploadConcurrency, filter) {
   const landingUrl = `${baseUrl}/landing`;
   const text = messageTemplate.replace('{link}', landingUrl);
+  const demographicRecipient = buildDemographicRecipient(filter);
 
-  // 1. Load all userIds from DB (streamed to avoid OOM on 13M rows)
+  // ── Path A: demographic filter only, no audience needed — 1 API call ──────
+  if (demographicRecipient && stmtCountUsers.get().cnt === 0) {
+    try {
+      await lineApi('POST', '/v2/bot/message/narrowcast', {
+        messages: [{ type: 'text', text }],
+        recipient: demographicRecipient,
+      });
+      stmtUpdateJob.run({ jobId, status: 'completed', sent: 0, failed: 0, finishedAt: new Date().toISOString() });
+      console.log(`Job ${jobId} (narrowcast, filter-only, 1 call) finished`);
+    } catch (err) {
+      console.error(`narrowcast filter-only failed: ${err.message}`);
+      stmtUpdateJob.run({ jobId, status: 'failed', sent: 0, failed: 0, finishedAt: new Date().toISOString() });
+    }
+    return;
+  }
+
+  // ── Path B: registered users → audience upload ───────────────────────────
   const allUsers = db.prepare(`SELECT userId FROM users`).pluck().all();
   const total = allUsers.length;
-
-  // 2. Slice into audience groups of up to AUDIENCE_SIZE each
   const audienceGroupIds = [];
   const groupCount = Math.ceil(total / AUDIENCE_SIZE);
 
   for (let gi = 0; gi < groupCount; gi++) {
     const groupUsers = allUsers.slice(gi * AUDIENCE_SIZE, (gi + 1) * AUDIENCE_SIZE);
 
-    // Create the audience group
     const created = await lineApi('POST', '/v2/bot/audienceGroup/upload', {
       description: `job_${jobId}_g${gi}`,
       isIfaAudience: false,
@@ -225,12 +275,10 @@ async function runNarrowcastJob(jobId, baseUrl, messageTemplate, uploadConcurren
     const audienceGroupId = created.audienceGroupId;
     audienceGroupIds.push(audienceGroupId);
 
-    // Upload users in parallel batches of AUDIENCE_UPLOAD (10K each)
     const uploadBatches = [];
     for (let i = 0; i < groupUsers.length; i += AUDIENCE_UPLOAD) {
       uploadBatches.push(groupUsers.slice(i, i + AUDIENCE_UPLOAD));
     }
-
     for (let i = 0; i < uploadBatches.length; i += uploadConcurrency) {
       await Promise.allSettled(
         uploadBatches.slice(i, i + uploadConcurrency).map((batch) =>
@@ -244,28 +292,23 @@ async function runNarrowcastJob(jobId, baseUrl, messageTemplate, uploadConcurren
     console.log(`Job ${jobId}: audience group ${gi + 1}/${groupCount} uploaded (${groupUsers.length} users)`);
   }
 
-  // 3. Wait for all audience groups to become READY
   console.log(`Job ${jobId}: waiting for ${audienceGroupIds.length} audience groups to be READY…`);
   await Promise.all(audienceGroupIds.map(waitForAudience));
   console.log(`Job ${jobId}: all audiences READY, starting narrowcast`);
 
-  // 4. Narrowcast sequentially (LINE enforces 1 active narrowcast at a time)
   for (let i = 0; i < audienceGroupIds.length; i++) {
+    // Combine audience recipient with demographic filter (AND) if provided
+    const audienceRecipient = { type: 'audience', audienceGroupId: audienceGroupIds[i] };
+    const recipient = mergeRecipients(audienceRecipient, demographicRecipient);
     await lineApi('POST', '/v2/bot/message/narrowcast', {
       messages: [{ type: 'text', text }],
-      recipient: { type: 'audience', audienceGroupId: audienceGroupIds[i] },
+      recipient,
     });
-    stmtIncrJob.run({
-      jobId,
-      s: Math.min(AUDIENCE_SIZE, total - i * AUDIENCE_SIZE),
-      f: 0,
-    });
+    stmtIncrJob.run({ jobId, s: Math.min(AUDIENCE_SIZE, total - i * AUDIENCE_SIZE), f: 0 });
     console.log(`Job ${jobId}: narrowcast ${i + 1}/${audienceGroupIds.length} sent`);
-    // Brief pause between narrowcasts
     if (i < audienceGroupIds.length - 1) await new Promise((r) => setTimeout(r, 2000));
   }
 
-  // 5. Cleanup audience groups (fire-and-forget, not critical)
   for (const id of audienceGroupIds) {
     lineApi('DELETE', `/v2/bot/audienceGroup/${id}`).catch((e) =>
       console.warn(`cleanup audience ${id} failed: ${e.message}`)
@@ -329,22 +372,35 @@ app.get('/my-link', (req, res) => {
 });
 
 // ─── Broadcast ────────────────────────────────────────────────────────────────
-// POST /broadcast  { mode?, baseUrl?, message?, concurrency? }
+// POST /broadcast  { mode?, baseUrl?, message?, concurrency?, filter? }
 //
-// mode = "broadcast"  (default) — 1 call, ALL followers, instant. LIFF personalizes on landing.
-// mode = "narrowcast"           — upload audiences → narrowcast per group. LIFF personalizes.
-//                                 Best for 13M+ registered users; LINE delivers on their side.
-// mode = "multicast"            — 500 users/call, registered only. LIFF personalizes on landing.
-// mode = "push"                 — 1 call/user, unique link visible directly in message. Slowest.
+// mode = "broadcast"  — 1 call, ALL followers, instant. No filter. LIFF personalizes.
+// mode = "narrowcast" — Fastest + filterable. Two sub-paths:
+//   • filter only (no audience upload)     → 1 call, demographic filter, instant ⭐
+//   • registered users (+ optional filter) → audience upload + narrowcast (LINE delivers)
+// mode = "multicast"  — 500 users/call, registered only. LIFF personalizes.
+// mode = "push"       — 1 call/user, unique link visible in message. Slowest.
+//
+// filter (narrowcast only): { gender?, ageMin?, ageMax?, os? }
+//   gender : "male" | "female"
+//   ageMin : "age_15"|"age_20"|"age_25"|"age_30"|"age_35"|"age_40"|"age_45"|"age_50"
+//   ageMax : same as ageMin
+//   os     : "ios" | "android"
 app.post('/broadcast', (req, res) => {
   const { cnt } = stmtCountUsers.get();
-  const mode = req.body.mode || 'broadcast';
+  const mode   = req.body.mode || 'broadcast';
+  const filter = req.body.filter || null;
 
   if (!['broadcast', 'narrowcast', 'multicast', 'push'].includes(mode)) {
     return res.status(400).json({ error: 'mode must be broadcast, narrowcast, multicast, or push' });
   }
-  if (mode !== 'broadcast' && cnt === 0) {
+  if (mode !== 'broadcast' && mode !== 'narrowcast' && cnt === 0) {
     return res.status(400).json({ error: 'No registered users found' });
+  }
+
+  // narrowcast requires either a demographic filter OR registered users
+  if (mode === 'narrowcast' && cnt === 0 && !buildDemographicRecipient(filter)) {
+    return res.status(400).json({ error: 'narrowcast requires filter.gender/ageMin/ageMax/os, or registered users' });
   }
 
   const baseUrl     = req.body.baseUrl || process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -356,20 +412,31 @@ app.post('/broadcast', (req, res) => {
   }
 
   const jobId = newToken();
-  stmtInsertJob.run({ jobId, total: cnt, message, baseUrl, startedAt: new Date().toISOString() });
+  stmtInsertJob.run({
+    jobId, total: cnt, message, baseUrl,
+    filter: filter ? JSON.stringify(filter) : null,
+    startedAt: new Date().toISOString(),
+  });
 
-  const audienceGroups = Math.ceil(cnt / AUDIENCE_SIZE);
+  // For narrowcast with filter only (no registered users) → 1 API call
+  const isFilterOnly = mode === 'narrowcast' && cnt === 0;
+  const audienceGroups = Math.ceil(cnt / AUDIENCE_SIZE) || 1;
   const modeInfo = {
-    broadcast:  { apiCalls: 1,                              label: '1 broadcast call (all followers)' },
-    narrowcast: { apiCalls: audienceGroups,                 label: `${audienceGroups} narrowcast calls (via ${audienceGroups} audience groups)` },
+    broadcast:  { apiCalls: 1,             label: '1 broadcast call (all followers)' },
+    narrowcast: {
+      apiCalls: isFilterOnly ? 1 : audienceGroups,
+      label: isFilterOnly
+        ? '1 narrowcast call (demographic filter, instant)'
+        : `${audienceGroups} narrowcast call(s) via audience groups${filter ? ' + demographic filter' : ''}`,
+    },
     multicast:  { apiCalls: Math.ceil(cnt / MULTICAST_BATCH), label: `${Math.ceil(cnt / MULTICAST_BATCH).toLocaleString()} multicast calls` },
-    push:       { apiCalls: cnt,                            label: `${cnt.toLocaleString()} push calls` },
+    push:       { apiCalls: cnt,           label: `${cnt.toLocaleString()} push calls` },
   }[mode];
 
   setImmediate(() => {
     const runner =
       mode === 'broadcast'  ? runBroadcastAllJob(jobId, baseUrl, message) :
-      mode === 'narrowcast' ? runNarrowcastJob(jobId, baseUrl, message, concurrency) :
+      mode === 'narrowcast' ? runNarrowcastJob(jobId, baseUrl, message, concurrency, filter) :
       mode === 'multicast'  ? runMulticastJob(jobId, baseUrl, message, concurrency) :
                               runPushJob(jobId, baseUrl, message, concurrency);
     runner.catch((err) => {
@@ -383,6 +450,7 @@ app.post('/broadcast', (req, res) => {
     mode,
     total: cnt,
     apiCalls: modeInfo.apiCalls,
+    filter: filter || undefined,
     message: `Broadcast started — ${modeInfo.label}`,
     statusUrl: `/broadcast/status/${jobId}`,
   });

@@ -7,38 +7,81 @@
 
 ## เปรียบเทียบ 4 Mode (สำหรับ 13 ล้านคน)
 
-| | `broadcast` ⭐ | `narrowcast` | `multicast` | `push` |
-|---|---|---|---|---|
-| **API calls** | **1** | **9** | **26,000** | **13,000,000** |
-| **เวลาโดยประมาณ** | **ทันที** | ~2-5 นาที* | ~2 นาที | หลายชั่วโมง |
-| **ส่งหา** | ทุก follower | registered เท่านั้น | registered เท่านั้น | registered เท่านั้น |
-| **ลิ้ง unique ใน message** | ❌ | ❌ | ❌ | ✅ |
-| **Personalize** | via LIFF | via LIFF | via LIFF | ใน message |
-| **Demographic filter** | ❌ | ✅ | ❌ | ❌ |
-| **Server load** | ต่ำมาก | ต่ำ (LINE ส่งให้) | ปานกลาง | สูงมาก |
+| | `broadcast` | `narrowcast` (filter only) ⭐ | `narrowcast` (audience) | `multicast` | `push` |
+|---|---|---|---|---|---|
+| **API calls** | **1** | **1** | **9** | **26,000** | **13,000,000** |
+| **เวลา** | ทันที | **ทันที** | ~2-5 นาที | ~2 นาที | หลายชั่วโมง |
+| **ส่งหา** | ทุก follower | ทุก follower + filter | registered + filter | registered เท่านั้น | registered เท่านั้น |
+| **demographic filter** | ❌ | ✅ gender/age/OS | ✅ gender/age/OS | ❌ | ❌ |
+| **Personalize** | via LIFF | via LIFF | via LIFF | via LIFF | ใน message |
 
-\* narrowcast: รวมเวลา upload audience + รอ LINE process (~1-3 นาที) + 9 narrowcast calls
-
-**สรุปแนะนำ:**
-- ต้องการส่งถึง **ทุก follower** และ personalize via LIFF → ใช้ **`broadcast`**
-- ต้องการ **demographic filter** หรือส่งเฉพาะ registered users → ใช้ **`narrowcast`**
-- ต้องการ **ลิ้ง unique ใน message เลย** (ไม่ผ่าน LIFF) → ใช้ **`push`** (ช้า)
+**⭐ แนะนำ: `narrowcast` + `filter`** — เร็วเท่า broadcast (1 call) แต่ filter ได้ด้วย
 
 ---
 
-## ทำไม Narrowcast ถึงดีสำหรับ 13 ล้าน
+## Filter Fields (สำหรับ narrowcast)
 
+| Field | Values |
+|---|---|
+| `gender` | `"male"` \| `"female"` |
+| `ageMin` | `"age_15"` \| `"age_20"` \| `"age_25"` \| `"age_30"` \| `"age_35"` \| `"age_40"` \| `"age_45"` \| `"age_50"` |
+| `ageMax` | เหมือน ageMin (exclusive upper bound) |
+| `os` | `"ios"` \| `"android"` |
+
+ใส่หลาย field = **AND** กันทั้งหมด
+
+---
+
+## ตัวอย่าง: เร็วสุด + filter ได้ (narrowcast, 1 call)
+
+```bash
+# ส่งเฉพาะผู้ชาย อายุ 20-35 ใช้ iOS
+curl -X POST https://your-domain.com/broadcast \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "narrowcast",
+    "message": "สวัสดี! ดูข้อมูลของคุณได้ที่นี่: {link}",
+    "filter": {
+      "gender": "male",
+      "ageMin": "age_20",
+      "ageMax": "age_35",
+      "os": "ios"
+    }
+  }'
 ```
-13M users ÷ 1,500,000 per audience = 9 audience groups
 
-Upload phase: 13M ÷ 10,000 per batch = 1,300 API calls
-              → parallel 50 concurrent = ~5 seconds
+Response (ทันที — 1 API call):
+```json
+{
+  "jobId": "uuid-...",
+  "mode": "narrowcast",
+  "total": 0,
+  "apiCalls": 1,
+  "filter": { "gender": "male", "ageMin": "age_20", "ageMax": "age_35", "os": "ios" },
+  "message": "Broadcast started — 1 narrowcast call (demographic filter, instant)"
+}
+```
 
-Wait phase:   LINE processes audiences async → ~1-3 minutes
+---
 
-Narrowcast:   9 sequential calls → ~18 seconds
+## ตัวอย่างอื่น
 
-Total: ~2-5 minutes  vs  Push: หลายชั่วโมง
+### Broadcast ทุกคน (เร็วสุด ไม่ filter)
+```bash
+curl -X POST https://your-domain.com/broadcast \
+  -d '{"mode":"broadcast","message":"สวัสดี! ลิ้งของคุณ: {link}"}'
+```
+
+### Narrowcast ผู้ใช้ที่ register + กรอง iOS เท่านั้น (13M users → 9 calls + filter)
+```bash
+curl -X POST https://your-domain.com/broadcast \
+  -d '{"mode":"narrowcast","filter":{"os":"ios"}}'
+```
+
+### Push (ลิ้ง unique อยู่ใน message เลย — ช้า)
+```bash
+curl -X POST https://your-domain.com/broadcast \
+  -d '{"mode":"push","message":"ลิ้งเฉพาะของคุณ: {link}"}'
 ```
 
 ---
@@ -52,13 +95,13 @@ LIFF (index.html/js)
 LINE Webhook (follow/message/unfollow)                  │
   └─ POST /webhook ───────────────────────────────►  SQLite (users.db)
                                                         │
-Admin triggers broadcast                                │
-  └─ POST /broadcast { mode } ───────────────────► background job
+POST /broadcast { mode, filter } ───────────────► background job
        returns jobId immediately                        │
-                         broadcast:   1 call ───────────┤
-                         narrowcast:  9 calls ──────────┤ (13M users)
-                         multicast: 26K calls ──────────┤
-                         push:       13M calls ─────────┘
+                    broadcast:              1 call ─────┤ (all followers)
+                    narrowcast filter-only: 1 call ─────┤ ⭐ fast + filterable
+                    narrowcast + audience:  9 calls ────┤ (13M, LINE delivers)
+                    multicast:          26K calls ───────┤
+                    push:               13M calls ───────┘
 
 User clicks link → /landing → liff.getProfile() → GET /my-link → personalized content
 ```
@@ -69,14 +112,11 @@ User clicks link → /landing → liff.getProfile() → GET /my-link → persona
 
 ```bash
 npm install
-cp .env.example .env   # แก้ไข credentials
+cp .env.example .env   # ใส่ credentials
 npm start
 ```
 
-ตั้ง Webhook URL ใน LINE Developers Console:
-```
-https://your-server-domain.com/webhook
-```
+ตั้ง Webhook URL: `https://your-domain.com/webhook`
 
 ---
 
@@ -86,45 +126,12 @@ https://your-server-domain.com/webhook
 |--------|------|-----------|
 | `POST` | `/webhook` | รับ events จาก LINE |
 | `POST` | `/register` | ลงทะเบียน userId จาก LIFF |
-| `GET`  | `/my-link?userId=` | ดึงลิ้งเฉพาะบุคคล (เรียกจาก landing page) |
-| `POST` | `/broadcast` | เริ่ม broadcast job (ตอบกลับทันที) |
+| `GET`  | `/my-link?userId=` | ดึงลิ้งเฉพาะบุคคล |
+| `POST` | `/broadcast` | เริ่ม broadcast job |
 | `GET`  | `/broadcast/status/:jobId` | ตรวจสอบ progress |
 | `GET`  | `/broadcast/status` | ดู 20 jobs ล่าสุด |
 | `GET`  | `/users?limit=&offset=` | ดูรายชื่อผู้ใช้ (paginated) |
 | `GET`  | `/landing` | หน้า personalized (LIFF) |
-
-### ตัวอย่าง: Broadcast (แนะนำ — 1 call)
-```bash
-curl -X POST https://your-domain.com/broadcast \
-  -H "Content-Type: application/json" \
-  -d '{"mode":"broadcast","message":"สวัสดี! ดูข้อมูลของคุณ: {link}"}'
-```
-
-### ตัวอย่าง: Narrowcast (registered users + LINE-side delivery)
-```bash
-curl -X POST https://your-domain.com/broadcast \
-  -H "Content-Type: application/json" \
-  -d '{"mode":"narrowcast","concurrency":50}'
-```
-
-### ตัวอย่าง: Push (ลิ้ง unique ใน message)
-```bash
-curl -X POST https://your-domain.com/broadcast \
-  -H "Content-Type: application/json" \
-  -d '{"mode":"push","message":"ลิ้งเฉพาะของคุณ: {link}"}'
-```
-
-Response (ทันที):
-```json
-{
-  "jobId": "uuid-...",
-  "mode": "narrowcast",
-  "total": 13000000,
-  "apiCalls": 9,
-  "message": "Broadcast started — 9 narrowcast calls (via 9 audience groups)",
-  "statusUrl": "/broadcast/status/uuid-..."
-}
-```
 
 ---
 

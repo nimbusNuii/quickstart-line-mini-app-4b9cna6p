@@ -1,6 +1,32 @@
 # LINE Mini App — Personalized Broadcast
 
-ส่ง LINE Push Message พร้อมลิ้งเฉพาะบุคคลให้ผู้ใช้แต่ละคน
+ส่ง LINE Push Message พร้อมลิ้งเฉพาะบุคคลให้ผู้ใช้แต่ละคน  
+รองรับผู้ใช้หลักล้านคนด้วย **SQLite + parallel batch sending + background job**
+
+---
+
+## Architecture
+
+```
+LIFF (index.html/js)
+  └─ POST /register ──────────────────────────────► server.js
+                                                        │
+LINE Webhook (follow/message/unfollow)                  │
+  └─ POST /webhook ───────────────────────────────►  SQLite (users.db)
+                                                        │
+Admin triggers broadcast                               │
+  └─ POST /broadcast ─────────────────────────────► background job
+       returns jobId immediately                        │
+                                                 parallel batches (50/batch)
+                                                        │
+       GET /broadcast/status/:jobId ◄──────────── progress tracking
+```
+
+**ทำไมถึงรองรับหลักล้านคน:**
+- **SQLite + WAL mode**: query/insert เร็ว, ไม่โหลดทุก row เข้า RAM
+- **Streaming iterator**: วนผ่าน users ทีละ chunk ไม่ allocate memory ครั้งเดียวทั้งหมด
+- **Parallel batches**: ส่ง 50 requests พร้อมกัน (ปรับได้), ไม่รอทีละคน
+- **Background job**: `/broadcast` ตอบกลับทันที, ติดตาม progress ผ่าน `/broadcast/status/:jobId`
 
 ---
 
@@ -48,8 +74,9 @@ https://your-server-domain.com/webhook
 |--------|------|-----------|
 | `POST` | `/webhook` | รับ events จาก LINE (follow, message, unfollow) |
 | `POST` | `/register` | ลงทะเบียน userId จาก LIFF และรับลิ้งส่วนตัว |
-| `POST` | `/broadcast` | ส่ง push message พร้อมลิ้งเฉพาะบุคคลให้ทุกคน |
-| `GET`  | `/users` | ดูรายชื่อผู้ใช้และลิ้งของแต่ละคน |
+| `POST` | `/broadcast` | เริ่ม broadcast job (ตอบกลับทันที พร้อม jobId) |
+| `GET`  | `/broadcast/status/:jobId` | ตรวจสอบ progress ของ broadcast job |
+| `GET`  | `/users?limit=100&offset=0` | ดูรายชื่อผู้ใช้แบบ paginated |
 | `GET`  | `/landing?ref=&uid=` | หน้าปลายทางของลิ้งเฉพาะบุคคล |
 
 ### ตัวอย่าง: ส่ง Broadcast
@@ -59,8 +86,37 @@ curl -X POST https://your-server-domain.com/broadcast \
   -H "Content-Type: application/json" \
   -d '{
     "baseUrl": "https://your-server-domain.com",
-    "message": "สวัสดี! นี่คือลิ้งเฉพาะสำหรับคุณ: {link}"
+    "message": "สวัสดี! นี่คือลิ้งเฉพาะสำหรับคุณ: {link}",
+    "concurrency": 50
   }'
+```
+
+Response (ทันที):
+```json
+{
+  "jobId": "uuid-...",
+  "total": 1500000,
+  "message": "Broadcast started for 1,500,000 users",
+  "statusUrl": "/broadcast/status/uuid-..."
+}
+```
+
+### ตรวจสอบ Progress
+
+```bash
+curl https://your-server-domain.com/broadcast/status/<jobId>
+```
+
+```json
+{
+  "jobId": "uuid-...",
+  "status": "completed",
+  "total": 1500000,
+  "sent": 1499873,
+  "failed": 127,
+  "startedAt": "2026-05-06T10:00:00.000Z",
+  "finishedAt": "2026-05-06T10:47:22.000Z"
+}
 ```
 
 `{link}` จะถูกแทนด้วยลิ้งเฉพาะของแต่ละคน เช่น  
@@ -75,7 +131,7 @@ curl -X POST https://your-server-domain.com/broadcast \
 ├── index.html       # LIFF frontend
 ├── index.js         # LIFF JavaScript
 ├── style.css        # Styles
-├── users.json       # ที่เก็บ userId (ถูก gitignore)
+├── users.db         # SQLite database (ถูก gitignore)
 ├── .env.example     # Template ตัวแปรสภาพแวดล้อม
 └── package.json
 ```

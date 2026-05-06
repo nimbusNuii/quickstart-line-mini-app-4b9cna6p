@@ -4,17 +4,30 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=0,viewport-fit=cover">
 <title>LINE MINI App</title>
-<!-- <script src="https://cdn.jsdelivr.net/gh/iamprompt/liff-sdk@latest/liff/edge/2/sdk.js"></script> -->
+<script charset="utf-8" src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<link rel="stylesheet" href="style.css">
 </head>
 <body id="body">
   <section id="profile">
     <img id="pictureUrl" src="https://vos.line-scdn.net/imgs/apis/ic_mini.png">
+    <p id="displayName">กำลังโหลด...</p>
+    <p id="userId" style="font-size:0.75em;color:#888;"></p>
   </section>
 
   <section id="feature">
+    <div id="myLinkSection" style="display:none;">
+      <p><b>ลิ้งเฉพาะของคุณ:</b></p>
+      <a id="myLink" href="#" target="_blank" id="myLink"></a>
+    </div>
+    <p id="statusMessage" style="color:#e00;"></p>
   </section>
 
   <section id="button">
+    <button id="btnRegister">ลงทะเบียนรับลิ้ง</button>
+    <button id="btnLogIn">เข้าสู่ระบบ</button>
+    <button id="btnLogOut">ออกจากระบบ</button>
   </section>
+
+  <script src="index.js"></script>
 </body>
 </html>

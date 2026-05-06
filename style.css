@@ -10,6 +10,8 @@ button {
   -moz-border-radius: 8px;
   -webkit-border-radius: 8px;
   border-radius: 8px;
+  font-size: 1em;
+  cursor: pointer;
 }
 
 p {
@@ -19,15 +21,7 @@ p {
 #pictureUrl {
   margin: 0 auto;
   width: 32%;
-  display: -moz-box;
-  display: -webkit-box;
-  display: box;
-  -moz-box-pack: center;
-  -moz-box-align: center;
-  -webkit-box-pack: center;
-  -webkit-box-align: center;
-  box-pack: center;
-  box-align: center;
+  display: block;
   -moz-border-radius: 256px;
   -webkit-border-radius: 256px;
   border-radius: 256px;
@@ -37,4 +31,22 @@ p {
 #utouId {
   display: block;
   overflow: auto;
+}
+
+#myLinkSection {
+  margin-top: 16px;
+  padding: 12px;
+  background: #f0faf0;
+  border-radius: 8px;
+  word-break: break-all;
+}
+
+#myLink {
+  color: #007a3d;
+  font-size: 0.9em;
+}
+
+#statusMessage {
+  margin-top: 12px;
+  font-size: 0.9em;
 }
